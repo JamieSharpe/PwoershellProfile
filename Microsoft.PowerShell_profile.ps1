@@ -17,7 +17,31 @@ catch {
 # Log all actions carried out. Guarded: hosts that cannot transcribe would
 # otherwise throw here and abort the rest of the profile.
 try {
-    Start-Transcript -OutputDirectory "$HOME\Shell Logs" -NoClobber -IncludeInvocationHeader -ErrorAction Stop | Out-Null
+    $LogDir = Join-Path $HOME 'Shell Logs'
+    if (-not (Test-Path -LiteralPath $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Timestamp leads so the folder sorts chronologically by name. The default
+    # -OutputDirectory naming puts a random token before the timestamp, which
+    # sorts by the random part instead. Milliseconds separate sessions started
+    # in the same second; machine and user identify the logs if the folder is
+    # ever synced or pooled; the host executable name gives the bare PID meaning
+    # once the process is gone.
+    $HostName = if ([Environment]::ProcessPath) {
+        [System.IO.Path]::GetFileNameWithoutExtension([Environment]::ProcessPath)
+    }
+    else {
+        (Get-Process -Id $PID).Name
+    }
+
+    # Usernames may contain spaces or characters that are awkward in a filename.
+    $UserName = $env:USERNAME -replace '[^\w-]', '_'
+
+    $LogName = 'PowerShell_transcript.{0}.{1}.{2}.{3}.{4}.txt' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss.fff'), $env:COMPUTERNAME, $UserName, $HostName, $PID
+
+    Start-Transcript -Path (Join-Path $LogDir $LogName) -NoClobber -IncludeInvocationHeader -ErrorAction Stop | Out-Null
+
     $null = Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PSEngineEvent]::Exiting) -Action {
         try { Stop-Transcript } catch { }
     }
