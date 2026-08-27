@@ -16,6 +16,13 @@ catch {
 
 # Log all actions carried out. Guarded: hosts that cannot transcribe would
 # otherwise throw here and abort the rest of the profile.
+#
+# Declared before the try so they exist even when it fails. The prompt reads
+# them: a session that is silently not being recorded is worth noticing while
+# it is happening, not when you go looking for the log afterwards.
+$PromptTranscriptPath    = $null
+$PromptTranscriptRunning = $false
+
 try {
     $LogDir = Join-Path $HOME 'Shell Logs'
     if (-not (Test-Path -LiteralPath $LogDir)) {
@@ -40,13 +47,21 @@ try {
 
     $LogName = 'PowerShell_transcript.{0}.{1}.{2}.{3}.{4}.txt' -f (Get-Date -Format 'yyyy-MM-dd_HHmmss.fff'), $env:COMPUTERNAME, $UserName, $HostName, $PID
 
-    Start-Transcript -Path (Join-Path $LogDir $LogName) -NoClobber -IncludeInvocationHeader -ErrorAction Stop | Out-Null
+    $PromptTranscriptPath = Join-Path $LogDir $LogName
+
+    Start-Transcript -Path $PromptTranscriptPath -NoClobber -IncludeInvocationHeader -ErrorAction Stop | Out-Null
+    $PromptTranscriptRunning = $true
+
+    # Said once, up front, so the path is in reach without hunting for it - and
+    # so its absence is conspicuous when transcription did not start.
+    Write-Host "Transcript: $PromptTranscriptPath" -ForegroundColor DarkGray
 
     $null = Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PSEngineEvent]::Exiting) -Action {
         try { Stop-Transcript } catch { }
     }
 }
 catch {
+    $PromptTranscriptRunning = $false
     Write-Warning "Transcript not started: $($_.Exception.Message)"
 }
 
@@ -158,11 +173,13 @@ function geturl {
 # A powerline prompt: coloured segments divided by Nerd Font separators, with
 # the caret on its own line so long paths never crowd what you type.
 #
-#   [ADMIN] [ssh] [user] [path] [git] [env] [jobs] [exit] [took] [time]
+#   [ADMIN] [ssh] [user@machine] [path] [git] [drive] [env] [jobs] [NO LOG]
+#   [exit] [took] [time]
 #   > _
 #
 # Every segment hides itself when it has nothing to say, so a plain local shell
-# in a plain directory shows only user, path and time.
+# in a plain directory shows only user, path and time. When the segments no
+# longer fit the window they wrap onto further lines rather than being cut off.
 #
 # Needs a Nerd Font in the terminal (Install-NerdFont.ps1) and 24-bit ANSI
 # colour; Windows Terminal gives both. Without a patched font set UseGlyphs to
@@ -178,14 +195,23 @@ $PromptSettings = [ordered]@{
     # 24-bit ANSI colour. Off gives an unstyled, plain-text prompt.
     UseColour = [bool]$Host.UI.SupportsVirtualTerminal
 
-    ShowUser = $true
-    ShowGit  = $true
-    ShowSsh  = $true
-    ShowJobs = $true
-    ShowEnv  = $true
-    ShowTime = $true
+    ShowUser    = $true
+    ShowMachine = $true
+    ShowGit     = $true
+    ShowSsh     = $true
+    ShowDrive   = $true
+    ShowJobs    = $true
+    ShowEnv     = $true
+    ShowTime    = $true
+
+    # Warn in the prompt itself when this session is not being transcribed.
+    ShowTranscriptWarning = $true
 
     TimeFormat = 'yyyy-MM-dd HH:mm:ss'
+
+    # Wrap the segments onto further lines when they outgrow the window, rather
+    # than letting the terminal fold them mid-block and tear the powerline.
+    MultiLine = $true
 
     # Counting untracked files means walking the worktree. The slow-repo guard
     # below is what keeps that honest on large trees.
@@ -205,6 +231,11 @@ $PromptSettings = [ordered]@{
     # One sluggish repo therefore costs one sluggish redraw, not every redraw.
     GitSlowThresholdMs = 750
 
+    # Flag the branch when the last fetch is older than this. Ahead/behind is
+    # only ever as truthful as the last fetch, and a stale one quietly reports
+    # "up to date" about a branch that has moved on.
+    FetchStaleThresholdHours = 24
+
     # Show the duration segment only for commands that took at least this long;
     # anything quicker is noise.
     DurationThresholdMs = 1000
@@ -212,6 +243,20 @@ $PromptSettings = [ordered]@{
     # Render the path in full up to this width, then abbreviate its parent
     # directories to single letters.
     MaxPathLength = 45
+
+    # Warn when the current drive has less than this much room. Imaging fills
+    # disks, and finding out at the end of a long copy is expensive.
+    LowSpaceThresholdGB = 10
+
+    # Reading the read-only flag off a volume needs a Win32 call, and compiling
+    # the wrapper for it costs the best part of a second - once per session, the
+    # first time it is needed. Removable, network and optical volumes are worth
+    # that; a plain fixed disk almost never is, so it is skipped there.
+    #
+    # Turn this on if you use a hardware write blocker: several present the
+    # blocked disk as Fixed, and its read-only state is then the single most
+    # important thing on the line.
+    ReadOnlyCheckAllDrives = $false
 
     # Environment variables worth surfacing, in the order they should appear,
     # each mapped to the label that introduces it. A value that is a rooted
@@ -242,8 +287,11 @@ $PromptSettings = [ordered]@{
         GitOperation = @{ Fg = '#FFFFFF'; Bg = '#B5651D' }
         GitConflict  = @{ Fg = '#FFFFFF'; Bg = '#8B2E2E' }
         GitPartial   = @{ Fg = '#E4E4E4'; Bg = '#5F5F5F' }
+        Drive        = @{ Fg = '#E4E4E4'; Bg = '#4A5568' }
+        DriveAlert   = @{ Fg = '#FFFFFF'; Bg = '#9B3030' }
         Env          = @{ Fg = '#0F2E2A'; Bg = '#3FA796' }
         Jobs         = @{ Fg = '#FFFFFF'; Bg = '#556B2F' }
+        NoLog        = @{ Fg = '#FFFFFF'; Bg = '#A31515' }
         Failed       = @{ Fg = '#FFFFFF'; Bg = '#A31515' }
         Duration     = @{ Fg = '#C6C6DA'; Bg = '#4B4B6A' }
         Time         = @{ Fg = '#9E9E9E'; Bg = '#2E2E2E' }
@@ -257,6 +305,8 @@ $PromptSettings = [ordered]@{
 # WindowsIdentity::GetCurrent() calls per keystroke-return.
 $PromptUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 if ($PromptUserName -like '*\*') { $PromptUserName = $PromptUserName.Split('\')[-1] }
+
+$PromptMachineName = $env:COMPUTERNAME
 
 $PromptIsAdmin = (New-Object Security.Principal.WindowsPrincipal(
                       [Security.Principal.WindowsIdentity]::GetCurrent())
@@ -276,6 +326,7 @@ $script:PromptHasGit = [bool](Get-Command git -CommandType Application -ErrorAct
 # into somewhere the prompt has already been.
 $script:PromptGitRoots      = @{}
 $script:PromptSlowRepos     = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$script:PromptDrives        = @{}
 $script:PromptLastHistoryId = -1
 
 # Tracked separately from the history id: the first draw of a session has no
@@ -283,11 +334,16 @@ $script:PromptLastHistoryId = -1
 # swallowed the mark for the session's very first command.
 $script:PromptDrawn = $false
 
+# Whatever last stopped the prompt from rendering, kept for inspection instead
+# of being reprinted on every redraw. See the catch at the end of prompt.
+$PromptLastError = $null
+
 function Reset-PromptCache {
     [CmdletBinding()]
     param()
     $script:PromptGitRoots.Clear()
     $script:PromptSlowRepos.Clear()
+    $script:PromptDrives.Clear()
 }
 
 # '#rrggbb' -> 'r;g;b', the tail of an ANSI colour sequence.
@@ -307,40 +363,56 @@ function Update-PromptTheme {
 
     $script:PromptGlyphs = if ($PromptSettings.UseGlyphs) {
         @{
-            Separator = "`u{e0b0}"   # solid right-pointing powerline arrow
-            Elevated  = "`u{f0e7}"   # bolt
-            Ssh       = "`u{f233} "  # server
-            User      = "`u{f007} "  # person
-            Folder    = "`u{f07b} "  # folder
-            Branch    = "`u{e0a0} "  # branch
-            Detached  = "`u{27a6} "  # hooked arrow, for a detached HEAD
-            Env       = "`u{f1b2} "  # cube
-            Jobs      = "`u{f013} "  # gear
-            Clock     = "`u{f017} "  # clock, for how long the last command took
-            Calendar  = "`u{f073} "  # calendar, for the wall clock
-            Failed    = "`u{f00d} "  # cross
-            Ahead     = "`u{21e1}"
-            Behind    = "`u{21e3}"
-            Caret     = "`u{276f}"
+            Separator  = "`u{e0b0}"   # solid right-pointing powerline arrow
+            Elevated   = "`u{f0e7}"   # bolt
+            Ssh        = "`u{f233}"   # server
+            User       = "`u{f007} "  # person
+            Folder     = "`u{f07b} "  # folder
+            Branch     = "`u{e0a0} "  # branch
+            Detached   = "`u{27a6} "  # hooked arrow, for a detached HEAD
+            NoUpstream = "`u{f127}"   # broken chain, for a branch never pushed
+            Fetch      = "`u{f021}"   # refresh, for a stale fetch
+            DriveFixed = "`u{f0a0}"   # hard disk
+            DriveUsb   = "`u{f287}"   # usb, for removable and optical media
+            DriveNet   = "`u{f0e8}"   # sitemap, for network drives
+            ReadOnly   = "`u{f023}"   # padlock
+            LowSpace   = "`u{f071}"   # warning triangle
+            NoLog      = "`u{f05e}"   # circle-slash, for "not being recorded"
+            Env        = "`u{f1b2} "  # cube
+            Jobs       = "`u{f013} "  # gear
+            Clock      = "`u{f017} "  # clock, for how long the last command took
+            Calendar   = "`u{f073} "  # calendar, for the wall clock
+            Failed     = "`u{f00d} "  # cross
+            Ahead      = "`u{21e1}"
+            Behind     = "`u{21e3}"
+            Caret      = "`u{276f}"
         }
     }
     else {
         @{
-            Separator = ' '
-            Elevated  = 'ADMIN'
-            Ssh       = 'ssh:'
-            User      = 'USER:'
-            Folder    = ''
-            Branch    = 'git:'
-            Detached  = 'at '
-            Env       = 'env:'
-            Jobs      = 'jobs:'
-            Clock     = 'took '
-            Calendar  = ''
-            Failed    = 'exit '
-            Ahead     = '+'
-            Behind    = '-'
-            Caret     = '>'
+            Separator  = ' '
+            Elevated   = 'ADMIN'
+            Ssh        = 'ssh'
+            User       = 'USER:'
+            Folder     = ''
+            Branch     = 'git:'
+            Detached   = 'at '
+            NoUpstream = 'no-upstream'
+            Fetch      = 'fetched '
+            DriveFixed = 'disk'
+            DriveUsb   = 'removable'
+            DriveNet   = 'network'
+            ReadOnly   = 'read-only'
+            LowSpace   = 'LOW'
+            NoLog      = 'NO LOG'
+            Env        = 'env:'
+            Jobs       = 'jobs:'
+            Clock      = 'took '
+            Calendar   = ''
+            Failed     = 'exit '
+            Ahead      = '+'
+            Behind     = '-'
+            Caret      = '>'
         }
     }
 
@@ -444,6 +516,20 @@ function Get-PromptGitOperation {
     return $null
 }
 
+# Hours since the last fetch, from the timestamp git leaves on FETCH_HEAD.
+# One file stat, and the only honest way to know whether ahead/behind means
+# anything. $null when the repo has never fetched.
+function Get-PromptFetchAge {
+    param([Parameter(Mandatory)][string] $GitDir)
+
+    $fetchHead = Join-Path $GitDir 'FETCH_HEAD'
+    if (-not (Test-Path -LiteralPath $fetchHead)) { return $null }
+
+    $written = (Get-Item -LiteralPath $fetchHead -ErrorAction Ignore).LastWriteTime
+    if (-not $written) { return $null }
+    return ((Get-Date) - $written).TotalHours
+}
+
 # Branch name only, straight out of HEAD. Used for repos that proved too slow to
 # call 'git status' on; costs one small file read.
 function Get-PromptGitHead {
@@ -465,6 +551,12 @@ function Get-PromptGitHead {
     # Cheap enough to keep even on a repo we gave up calling git on, and it is
     # the one piece of state you most want to be reminded of.
     $info.Operation = Get-PromptGitOperation $gitDir
+
+    # Deliberately not set here: without 'git status' we cannot know whether an
+    # upstream exists, and a fetch age with nothing to compare against would
+    # only invite the wrong conclusion.
+    $info.HasUpstream = $true
+    $info.FetchAge    = $null
     return $info
 }
 
@@ -490,6 +582,7 @@ function Get-PromptGitInfo {
 
     $info = @{
         Branch = ''; Oid = ''; Detached = $false; Partial = $false; Operation = $null
+        HasUpstream = $false; FetchAge = $null
         Ahead  = 0;  Behind = 0
         Staged = 0;  Unstaged = 0; Untracked = 0; Conflicts = 0; Stashed = 0
     }
@@ -513,6 +606,11 @@ function Get-PromptGitInfo {
                 elseif ($line -match '^# branch\.oid (.+)$') {
                     $info.Oid = $Matches[1]
                 }
+                # Emitted only when the branch actually tracks something, which
+                # is exactly what makes its absence worth reporting.
+                elseif ($line -match '^# branch\.upstream (.+)$') {
+                    $info.HasUpstream = $true
+                }
                 elseif ($line -match '^# branch\.ab \+(\d+) -(\d+)') {
                     $info.Ahead = [int]$Matches[1]; $info.Behind = [int]$Matches[2]
                 }
@@ -528,6 +626,10 @@ function Get-PromptGitInfo {
     if ($gitDir) {
         $info.Operation = Get-PromptGitOperation $gitDir
 
+        # Only meaningful against an upstream; on a purely local branch there is
+        # nothing the fetch would have been comparing to.
+        if ($info.HasUpstream) { $info.FetchAge = Get-PromptFetchAge $gitDir }
+
         # The reflog is the cheap way to count stashes: 'git stash list' would
         # be a second process per redraw.
         $stashLog = Join-Path $gitDir 'logs\refs\stash'
@@ -537,6 +639,82 @@ function Get-PromptGitInfo {
     }
 
     return $info
+}
+
+# True when the volume is mounted read-only. There is no managed API for this,
+# so it goes through Win32 - and compiling that wrapper is slow enough that it
+# is done on first use rather than at profile load, and only for the drives
+# $PromptSettings says are worth asking about.
+function Test-PromptDriveReadOnly {
+    param([Parameter(Mandatory)][string] $Root)
+
+    if (-not ('PromptWin32Volume' -as [type])) {
+        Add-Type -Namespace Prompt -Name Win32Volume -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool GetVolumeInformationW(
+    string rootPathName,
+    System.Text.StringBuilder volumeNameBuffer, int volumeNameSize,
+    out uint volumeSerialNumber, out uint maximumComponentLength,
+    out uint fileSystemFlags,
+    System.Text.StringBuilder fileSystemNameBuffer, int fileSystemNameSize);
+'@ -ErrorAction Stop
+    }
+
+    $name = [System.Text.StringBuilder]::new(261)
+    $fs   = [System.Text.StringBuilder]::new(261)
+    [uint32]$serial = 0
+    [uint32]$maxLen = 0
+    [uint32]$flags  = 0
+
+    if (-not [Prompt.Win32Volume]::GetVolumeInformationW($Root, $name, $name.Capacity, [ref]$serial, [ref]$maxLen, [ref]$flags, $fs, $fs.Capacity)) {
+        return $false
+    }
+
+    # FILE_READ_ONLY_VOLUME
+    return [bool]($flags -band 0x00080000)
+}
+
+# What kind of volume the current directory sits on, how much room is left, and
+# whether it is write protected. Cached per drive: none of it changes often, and
+# the read-only probe in particular is not something to repeat per keystroke.
+function Get-PromptDriveInfo {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if (-not $root) { return $null }
+
+    if ($script:PromptDrives.ContainsKey($root)) { return $script:PromptDrives[$root] }
+
+    $result = $null
+    try {
+        $drive = [System.IO.DriveInfo]::new($root)
+        if ($drive.IsReady) {
+            $checkReadOnly = $PromptSettings.ReadOnlyCheckAllDrives -or
+                             $drive.DriveType -in @([System.IO.DriveType]::Removable,
+                                                    [System.IO.DriveType]::Network,
+                                                    [System.IO.DriveType]::CDRom)
+
+            $readOnly = $false
+            if ($checkReadOnly) {
+                try { $readOnly = Test-PromptDriveReadOnly -Root $root }
+                catch { $readOnly = $false }
+            }
+
+            $result = @{
+                Root      = $root.TrimEnd('\', '/')
+                Type      = $drive.DriveType
+                FreeBytes = $drive.AvailableFreeSpace
+                ReadOnly  = $readOnly
+            }
+        }
+    }
+    catch {
+        # An unavailable or exotic volume simply gets no segment.
+        $result = $null
+    }
+
+    $script:PromptDrives[$root] = $result
+    return $result
 }
 
 # Cut a path down to MaxLength by abbreviating its parent directories to a
@@ -620,6 +798,24 @@ function Format-PromptDuration {
     return '{0}h {1}m {2}s' -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds
 }
 
+# Coarse on purpose: the point is "how stale", not the exact interval.
+function Format-PromptAge {
+    param([Parameter(Mandatory)][double] $Hours)
+
+    if ($Hours -lt 48)      { return '{0}h' -f [int]$Hours }
+    if ($Hours -lt 24 * 14) { return '{0}d' -f [int]($Hours / 24) }
+    return '{0}w' -f [int]($Hours / (24 * 7))
+}
+
+function Format-PromptBytes {
+    param([Parameter(Mandatory)][double] $Bytes)
+
+    if ($Bytes -ge 1TB) { return '{0:0.#} TB' -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB) { return '{0:0.#} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:0} MB'   -f ($Bytes / 1MB) }
+    return '{0:0} KB' -f ($Bytes / 1KB)
+}
+
 # Whichever of the watched environment variables are set, in configured order.
 # Reading environment variables is free, which is the whole reason this segment
 # is limited to them.
@@ -660,35 +856,80 @@ function Get-PromptExitStatus {
     return 1
 }
 
-# Join the segments into one powerline strip. Each divider is drawn in the
-# outgoing segment's background against the incoming one's, which is what welds
-# the blocks together; the last is drawn against the terminal's own background.
+# How wide the prompt may be before it wraps. Zero means "do not wrap", which is
+# also what a redirected or headless host gets, since there is no width to ask.
+function Get-PromptWidth {
+    [CmdletBinding()]
+    param()
+
+    if (-not $PromptSettings.MultiLine) { return 0 }
+
+    try {
+        $width = $Host.UI.RawUI.WindowSize.Width
+        if ($width -gt 20) { return $width }
+    }
+    catch { }
+    return 0
+}
+
+# Join the segments into powerline strips, one per line. Each divider is drawn
+# in the outgoing segment's background against the incoming one's, which is what
+# welds the blocks together; the last on a line is drawn against the terminal's
+# own background.
+#
+# Segment text is plain - all the colour lives in the styles - so its length is
+# its width on screen, which is what makes the wrapping arithmetic honest.
 function Format-PromptLine {
     param([Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.IList] $Segments)
 
     if ($Segments.Count -eq 0) { return '' }
 
-    if (-not $PromptSettings.UseColour) {
-        return (($Segments | ForEach-Object { $_.Text.Trim() }) -join ' ')
-    }
-
     $separator = $script:PromptGlyphs.Separator
     $reset     = "`e[0m"
-    $sb        = [System.Text.StringBuilder]::new()
+    $width     = Get-PromptWidth
 
-    for ($i = 0; $i -lt $Segments.Count; $i++) {
-        $style = $script:PromptStyles[$Segments[$i].Style]
-        [void]$sb.Append($style.Set).Append($Segments[$i].Text)
+    # Pack the segments into rows that fit. Each costs its own text plus the one
+    # separator cell that follows it. Done before rendering so that the plain,
+    # uncoloured prompt wraps on the same terms as the decorated one.
+    $rows    = [System.Collections.Generic.List[object]]::new()
+    $current = [System.Collections.Generic.List[object]]::new()
+    $used    = 0
 
-        if ($i -lt $Segments.Count - 1) {
-            $next = $script:PromptStyles[$Segments[$i + 1].Style]
-            [void]$sb.Append($style.BgAsFg).Append($next.Bg).Append($separator)
+    foreach ($segment in $Segments) {
+        $cost = $segment.Text.Length + 1
+        if ($width -gt 0 -and $current.Count -gt 0 -and ($used + $cost) -gt $width) {
+            $rows.Add($current)
+            $current = [System.Collections.Generic.List[object]]::new()
+            $used    = 0
         }
-        else {
-            [void]$sb.Append($reset).Append($style.BgAsFg).Append($separator).Append($reset)
-        }
+        $current.Add($segment)
+        $used += $cost
     }
-    return $sb.ToString()
+    if ($current.Count -gt 0) { $rows.Add($current) }
+
+    if (-not $PromptSettings.UseColour) {
+        $plain = foreach ($row in $rows) { (($row | ForEach-Object { $_.Text.Trim() }) -join ' ') }
+        return ($plain -join "`n")
+    }
+
+    $lines = foreach ($row in $rows) {
+        $sb = [System.Text.StringBuilder]::new()
+        for ($i = 0; $i -lt $row.Count; $i++) {
+            $style = $script:PromptStyles[$row[$i].Style]
+            [void]$sb.Append($style.Set).Append($row[$i].Text)
+
+            if ($i -lt $row.Count - 1) {
+                $next = $script:PromptStyles[$row[$i + 1].Style]
+                [void]$sb.Append($style.BgAsFg).Append($next.Bg).Append($separator)
+            }
+            else {
+                [void]$sb.Append($reset).Append($style.BgAsFg).Append($separator).Append($reset)
+            }
+        }
+        $sb.ToString()
+    }
+
+    return ($lines -join "`n")
 }
 
 function prompt {
@@ -701,161 +942,228 @@ function prompt {
     $lastExit  = $global:LASTEXITCODE
     $lastError = $global:Error[0]
 
-    $glyphs   = $script:PromptGlyphs
-    $segments = [System.Collections.Generic.List[hashtable]]::new()
+    try {
+        $glyphs   = $script:PromptGlyphs
+        $segments = [System.Collections.Generic.List[hashtable]]::new()
 
-    # Whether a command actually ran since the last redraw. Pressing Enter on an
-    # empty line, or Ctrl+C, leaves history untouched; both the duration segment
-    # and the terminal's end-of-command mark need to know that.
-    $lastHistory     = Get-History -Count 1
-    $isFirstPrompt   = -not $script:PromptDrawn
-    $historyAdvanced = $lastHistory -and $lastHistory.Id -ne $script:PromptLastHistoryId
+        # Whether a command actually ran since the last redraw. Pressing Enter on
+        # an empty line, or Ctrl+C, leaves history untouched; both the duration
+        # segment and the terminal's end-of-command mark need to know that.
+        $lastHistory     = Get-History -Count 1
+        $isFirstPrompt   = -not $script:PromptDrawn
+        $historyAdvanced = $lastHistory -and $lastHistory.Id -ne $script:PromptLastHistoryId
 
-    $location     = $ExecutionContext.SessionState.Path.CurrentLocation
-    $isFileSystem = $location.Provider.Name -eq 'FileSystem'
+        $location     = $ExecutionContext.SessionState.Path.CurrentLocation
+        $isFileSystem = $location.Provider.Name -eq 'FileSystem'
 
-    # The repo has to be resolved before the path, because inside one the path
-    # is rendered relative to it.
-    $gitRoot = $null
-    $git     = $null
-    if ($PromptSettings.ShowGit -and $script:PromptHasGit -and $isFileSystem) {
-        $gitRoot = Get-PromptGitRoot $location.ProviderPath
-        if ($gitRoot) { $git = Get-PromptGitInfo $gitRoot }
-    }
-
-    $shortPath = if (-not $isFileSystem) {
-        $location.Path
-    }
-    elseif ($gitRoot -and $PromptSettings.PathRelativeToRepo) {
-        Format-PromptRepoPath -Path $location.ProviderPath -Root $gitRoot -MaxLength $PromptSettings.MaxPathLength
-    }
-    else {
-        Format-PromptPath -Path $location.ProviderPath -MaxLength $PromptSettings.MaxPathLength
-    }
-
-    if ($PromptIsAdmin) {
-        $segments.Add(@{ Style = 'Elevated'; Text = (' {0} ' -f $glyphs.Elevated.Trim()) })
-    }
-
-    if ($PromptSettings.ShowSsh -and $script:PromptIsSsh) {
-        $segments.Add(@{ Style = 'Ssh'; Text = (' {0}{1} ' -f $glyphs.Ssh, $env:COMPUTERNAME) })
-    }
-
-    if ($PromptSettings.ShowUser) {
-        $segments.Add(@{ Style = 'User'; Text = (' {0}{1} ' -f $glyphs.User, $PromptUserName) })
-    }
-
-    $segments.Add(@{ Style = 'Path'; Text = (' {0}{1} ' -f $glyphs.Folder, $shortPath) })
-
-    if ($git) {
-        $label = if ($git.Detached) { '{0}{1}' -f $glyphs.Detached, $git.Branch }
-                 else               { '{0}{1}' -f $glyphs.Branch,   $git.Branch }
-
-        $marks = [System.Collections.Generic.List[string]]::new()
-        if ($git.Ahead)     { $marks.Add(('{0}{1}' -f $glyphs.Ahead,  $git.Ahead)) }
-        if ($git.Behind)    { $marks.Add(('{0}{1}' -f $glyphs.Behind, $git.Behind)) }
-        if ($git.Staged)    { $marks.Add('+{0}' -f $git.Staged) }
-        if ($git.Unstaged)  { $marks.Add('!{0}' -f $git.Unstaged) }
-        if ($git.Untracked) { $marks.Add('?{0}' -f $git.Untracked) }
-        if ($git.Conflicts) { $marks.Add('~{0}' -f $git.Conflicts) }
-        if ($git.Stashed)   { $marks.Add('*{0}' -f $git.Stashed) }
-
-        # The operation reads as part of the branch, the way git itself says
-        # "interactive rebase in progress", so it goes next to the name.
-        if ($git.Operation) { $label = '{0}|{1}' -f $label, $git.Operation }
-
-        # Conflicts outrank a running operation: mid-rebase is context, but a
-        # conflict is the thing actually blocking you. Grey says "branch only,
-        # state unknown" for a repo whose status call was skipped, and must not
-        # read as a clean worktree.
-        $gitStyle = if     ($git.Partial)       { 'GitPartial' }
-                    elseif ($git.Conflicts)     { 'GitConflict' }
-                    elseif ($git.Operation)     { 'GitOperation' }
-                    elseif ($marks.Count -gt 0) { 'GitDirty' }
-                    else                        { 'GitClean' }
-
-        $segments.Add(@{ Style = $gitStyle; Text = (' {0} ' -f ((@($label) + $marks) -join ' ')) })
-    }
-
-    if ($PromptSettings.ShowEnv) {
-        $envContext = Get-PromptEnvContext
-        if ($envContext) { $segments.Add(@{ Style = 'Env'; Text = (' {0}{1} ' -f $glyphs.Env, $envContext) }) }
-    }
-
-    if ($PromptSettings.ShowJobs) {
-        $jobs = @(Get-Job -State Running -ErrorAction Ignore).Count
-        if ($jobs -gt 0) { $segments.Add(@{ Style = 'Jobs'; Text = (' {0}{1} ' -f $glyphs.Jobs, $jobs) }) }
-    }
-
-    # Gate on $? alone: $LASTEXITCODE lingers from the last native command, so on
-    # its own it would keep flagging a failure long after a successful cmdlet.
-    if (-not $succeeded) {
-        $code = if ($lastExit) { $lastExit } else { 1 }
-        $segments.Add(@{ Style = 'Failed'; Text = (' {0}{1} ' -f $glyphs.Failed, $code) })
-    }
-
-    # Only for a command that actually just ran; without the history check the
-    # previous command's duration would sit there looking current.
-    if ($historyAdvanced) {
-        $elapsed = ($lastHistory.EndExecutionTime - $lastHistory.StartExecutionTime).TotalSeconds
-        if ($elapsed * 1000 -ge $PromptSettings.DurationThresholdMs) {
-            $segments.Add(@{ Style = 'Duration'; Text = (' {0}{1} ' -f $glyphs.Clock, (Format-PromptDuration $elapsed)) })
+        # The repo has to be resolved before the path, because inside one the
+        # path is rendered relative to it.
+        $gitRoot = $null
+        $git     = $null
+        if ($PromptSettings.ShowGit -and $script:PromptHasGit -and $isFileSystem) {
+            $gitRoot = Get-PromptGitRoot $location.ProviderPath
+            if ($gitRoot) { $git = Get-PromptGitInfo $gitRoot }
         }
-    }
 
-    if ($PromptSettings.ShowTime) {
-        $segments.Add(@{ Style = 'Time'; Text = (' {0}{1} ' -f $glyphs.Calendar, (Get-Date -Format $PromptSettings.TimeFormat)) })
-    }
-
-    $host.UI.RawUI.WindowTitle = if ($PromptIsAdmin) { "Admin: $shortPath" } else { $shortPath }
-
-    # One caret per nesting level, so a nested prompt is obvious.
-    $caret = $glyphs.Caret * (1 + $NestedPromptLevel)
-    if ($PromptSettings.UseColour) {
-        $caretStyle = if ($succeeded) { $script:PromptStyles['CaretOk'] } else { $script:PromptStyles['CaretFail'] }
-        $caret = '{0}{1}{2}' -f $caretStyle.Fg, $caret, "`e[0m"
-    }
-
-    $out = [System.Text.StringBuilder]::new()
-
-    # Shell integration marks. These print nothing; they tell Windows Terminal
-    # where a prompt starts, where typing starts, and how the last command
-    # ended, which is what powers scrollbar marks, jumping between commands
-    # with scrollToMark, selecting a whole command's output, and opening new
-    # tabs in this directory. Terminal needs autoMarkPrompts and
-    # showMarksOnScrollbar turned on to act on them.
-    if ($PromptSettings.ShellIntegration -and -not $isFirstPrompt) {
-        if ($historyAdvanced) {
-            $status = Get-PromptExitStatus -Succeeded $succeeded -LastExit $lastExit -LastError $lastError -LastHistory $lastHistory
-            [void]$out.Append("`e]133;D;$status`a")
+        $shortPath = if (-not $isFileSystem) {
+            $location.Path
+        }
+        elseif ($gitRoot -and $PromptSettings.PathRelativeToRepo) {
+            Format-PromptRepoPath -Path $location.ProviderPath -Root $gitRoot -MaxLength $PromptSettings.MaxPathLength
         }
         else {
-            # Ctrl+C, or Enter on an empty line: nothing ran, so there is no
-            # exit code to report and an omitted one leaves the mark uncoloured.
-            [void]$out.Append("`e]133;D`a")
+            Format-PromptPath -Path $location.ProviderPath -MaxLength $PromptSettings.MaxPathLength
         }
+
+        if ($PromptIsAdmin) {
+            $segments.Add(@{ Style = 'Elevated'; Text = (' {0} ' -f $glyphs.Elevated.Trim()) })
+        }
+
+        # Just a marker now: the machine name lives in the user segment, and
+        # saying it twice on one line helps nobody.
+        if ($PromptSettings.ShowSsh -and $script:PromptIsSsh) {
+            $segments.Add(@{ Style = 'Ssh'; Text = (' {0} ' -f $glyphs.Ssh.Trim()) })
+        }
+
+        if ($PromptSettings.ShowUser) {
+            $who = if ($PromptSettings.ShowMachine) { '{0}@{1}' -f $PromptUserName, $PromptMachineName }
+                   else                             { $PromptUserName }
+            $segments.Add(@{ Style = 'User'; Text = (' {0}{1} ' -f $glyphs.User, $who) })
+        }
+
+        $segments.Add(@{ Style = 'Path'; Text = (' {0}{1} ' -f $glyphs.Folder, $shortPath) })
+
+        if ($git) {
+            $label = if ($git.Detached) { '{0}{1}' -f $glyphs.Detached, $git.Branch }
+                     else               { '{0}{1}' -f $glyphs.Branch,   $git.Branch }
+
+            $marks = [System.Collections.Generic.List[string]]::new()
+
+            # A branch with no upstream shows no ahead/behind at all, which
+            # otherwise looks identical to being perfectly in sync.
+            if (-not $git.Detached -and -not $git.HasUpstream) {
+                $marks.Add($glyphs.NoUpstream)
+            }
+
+            if ($git.Ahead)     { $marks.Add(('{0}{1}' -f $glyphs.Ahead,  $git.Ahead)) }
+            if ($git.Behind)    { $marks.Add(('{0}{1}' -f $glyphs.Behind, $git.Behind)) }
+            if ($git.Staged)    { $marks.Add('+{0}' -f $git.Staged) }
+            if ($git.Unstaged)  { $marks.Add('!{0}' -f $git.Unstaged) }
+            if ($git.Untracked) { $marks.Add('?{0}' -f $git.Untracked) }
+            if ($git.Conflicts) { $marks.Add('~{0}' -f $git.Conflicts) }
+            if ($git.Stashed)   { $marks.Add('*{0}' -f $git.Stashed) }
+
+            if ($null -ne $git.FetchAge -and $git.FetchAge -ge $PromptSettings.FetchStaleThresholdHours) {
+                $marks.Add(('{0}{1}' -f $glyphs.Fetch, (Format-PromptAge $git.FetchAge)))
+            }
+
+            # The operation reads as part of the branch, the way git itself says
+            # "interactive rebase in progress", so it goes next to the name.
+            if ($git.Operation) { $label = '{0}|{1}' -f $label, $git.Operation }
+
+            # Conflicts outrank a running operation: mid-rebase is context, but a
+            # conflict is the thing actually blocking you. Grey says "branch
+            # only, state unknown" for a repo whose status call was skipped, and
+            # must not read as a clean worktree.
+            $gitStyle = if     ($git.Partial)       { 'GitPartial' }
+                        elseif ($git.Conflicts)     { 'GitConflict' }
+                        elseif ($git.Operation)     { 'GitOperation' }
+                        elseif ($marks.Count -gt 0) { 'GitDirty' }
+                        else                        { 'GitClean' }
+
+            $segments.Add(@{ Style = $gitStyle; Text = (' {0} ' -f ((@($label) + $marks) -join ' ')) })
+        }
+
+        # Shown only when there is something to say about the volume: a local
+        # fixed disk with room on it is the unremarkable case and stays quiet.
+        if ($PromptSettings.ShowDrive -and $isFileSystem) {
+            $drive = Get-PromptDriveInfo -Path $location.ProviderPath
+            if ($drive) {
+                $lowSpace  = $drive.FreeBytes -lt ($PromptSettings.LowSpaceThresholdGB * 1GB)
+                $notFixed  = $drive.Type -ne [System.IO.DriveType]::Fixed
+
+                if ($lowSpace -or $drive.ReadOnly -or $notFixed) {
+                    $typeGlyph = switch ($drive.Type) {
+                        ([System.IO.DriveType]::Removable) { $glyphs.DriveUsb }
+                        ([System.IO.DriveType]::CDRom)     { $glyphs.DriveUsb }
+                        ([System.IO.DriveType]::Network)   { $glyphs.DriveNet }
+                        default                            { $glyphs.DriveFixed }
+                    }
+
+                    $parts = [System.Collections.Generic.List[string]]::new()
+                    $parts.Add(('{0} {1}' -f $typeGlyph, $drive.Root))
+                    if ($drive.ReadOnly) { $parts.Add($glyphs.ReadOnly) }
+                    if ($lowSpace)       { $parts.Add(('{0} {1}' -f $glyphs.LowSpace, (Format-PromptBytes $drive.FreeBytes))) }
+
+                    # Read-only is information - often the point, with a write
+                    # blocker. Running out of room is the only actual alarm.
+                    $driveStyle = if ($lowSpace) { 'DriveAlert' } else { 'Drive' }
+                    $segments.Add(@{ Style = $driveStyle; Text = (' {0} ' -f ($parts -join ' ')) })
+                }
+            }
+        }
+
+        if ($PromptSettings.ShowEnv) {
+            $envContext = Get-PromptEnvContext
+            if ($envContext) { $segments.Add(@{ Style = 'Env'; Text = (' {0}{1} ' -f $glyphs.Env, $envContext) }) }
+        }
+
+        if ($PromptSettings.ShowJobs) {
+            $jobs = @(Get-Job -State Running -ErrorAction Ignore).Count
+            if ($jobs -gt 0) { $segments.Add(@{ Style = 'Jobs'; Text = (' {0}{1} ' -f $glyphs.Jobs, $jobs) }) }
+        }
+
+        # The startup warning scrolls away in seconds; this does not. Worth the
+        # space, because the alternative is finding out afterwards that a whole
+        # session went unrecorded.
+        if ($PromptSettings.ShowTranscriptWarning -and -not $PromptTranscriptRunning) {
+            $segments.Add(@{ Style = 'NoLog'; Text = (' {0} ' -f $glyphs.NoLog.Trim()) })
+        }
+
+        # Gate on $? alone: $LASTEXITCODE lingers from the last native command,
+        # so on its own it would keep flagging a failure long after a successful
+        # cmdlet.
+        if (-not $succeeded) {
+            $code = if ($lastExit) { $lastExit } else { 1 }
+            $segments.Add(@{ Style = 'Failed'; Text = (' {0}{1} ' -f $glyphs.Failed, $code) })
+        }
+
+        # Only for a command that actually just ran; without the history check
+        # the previous command's duration would sit there looking current.
+        if ($historyAdvanced) {
+            $elapsed = ($lastHistory.EndExecutionTime - $lastHistory.StartExecutionTime).TotalSeconds
+            if ($elapsed * 1000 -ge $PromptSettings.DurationThresholdMs) {
+                $segments.Add(@{ Style = 'Duration'; Text = (' {0}{1} ' -f $glyphs.Clock, (Format-PromptDuration $elapsed)) })
+            }
+        }
+
+        if ($PromptSettings.ShowTime) {
+            $segments.Add(@{ Style = 'Time'; Text = (' {0}{1} ' -f $glyphs.Calendar, (Get-Date -Format $PromptSettings.TimeFormat)) })
+        }
+
+        $host.UI.RawUI.WindowTitle = if ($PromptIsAdmin) { "Admin: $shortPath" } else { $shortPath }
+
+        # One caret per nesting level, so a nested prompt is obvious.
+        $caret = $glyphs.Caret * (1 + $NestedPromptLevel)
+        if ($PromptSettings.UseColour) {
+            $caretStyle = if ($succeeded) { $script:PromptStyles['CaretOk'] } else { $script:PromptStyles['CaretFail'] }
+            $caret = '{0}{1}{2}' -f $caretStyle.Fg, $caret, "`e[0m"
+        }
+
+        $out = [System.Text.StringBuilder]::new()
+
+        # Shell integration marks. These print nothing; they tell Windows
+        # Terminal where a prompt starts, where typing starts, and how the last
+        # command ended, which is what powers scrollbar marks, jumping between
+        # commands with scrollToMark, selecting a whole command's output, and
+        # opening new tabs in this directory. Terminal needs autoMarkPrompts and
+        # showMarksOnScrollbar turned on to act on them.
+        if ($PromptSettings.ShellIntegration -and -not $isFirstPrompt) {
+            if ($historyAdvanced) {
+                $status = Get-PromptExitStatus -Succeeded $succeeded -LastExit $lastExit -LastError $lastError -LastHistory $lastHistory
+                [void]$out.Append("`e]133;D;$status`a")
+            }
+            else {
+                # Ctrl+C, or Enter on an empty line: nothing ran, so there is no
+                # exit code to report and an omitted one leaves the mark
+                # uncoloured.
+                [void]$out.Append("`e]133;D`a")
+            }
+        }
+
+        [void]$out.Append("`n")
+
+        if ($PromptSettings.ShellIntegration) {
+            [void]$out.Append("`e]133;A`a")
+            if ($isFileSystem) { [void]$out.Append("`e]9;9;`"$($location.ProviderPath)`"`a") }
+        }
+
+        # Built as one multi-line string rather than written with Write-Host, so
+        # PSReadLine knows the whole prompt and can redraw it intact.
+        [void]$out.Append((Format-PromptLine $segments)).Append("`n").Append($caret).Append(' ')
+
+        if ($PromptSettings.ShellIntegration) { [void]$out.Append("`e]133;B`a") }
+
+        if ($lastHistory) { $script:PromptLastHistoryId = $lastHistory.Id }
+        $script:PromptDrawn = $true
+
+        # Leave $LASTEXITCODE as the command left it: the git call above
+        # overwrote it, and code that reads it after the prompt has drawn
+        # deserves the truth.
+        $global:LASTEXITCODE = $lastExit
+        return $out.ToString()
     }
-
-    [void]$out.Append("`n")
-
-    if ($PromptSettings.ShellIntegration) {
-        [void]$out.Append("`e]133;A`a")
-        if ($isFileSystem) { [void]$out.Append("`e]9;9;`"$($location.ProviderPath)`"`a") }
+    catch {
+        # A prompt that throws prints its exception on every single redraw and
+        # leaves the session barely usable. Fall back to something plain instead,
+        # and keep the error in $PromptLastError for inspection rather than
+        # reprinting it forever. Anything above can fail - a deleted working
+        # directory, an unreadable repo, a volume that went away - and none of
+        # that is worth losing the shell over.
+        $global:PromptLastError = $_
+        $global:LASTEXITCODE    = $lastExit
+        return "`nPS $($PWD.Path) [prompt failed: see `$PromptLastError]`n> "
     }
-
-    # Built as one multi-line string rather than written with Write-Host, so
-    # PSReadLine knows the whole prompt and can redraw it intact.
-    [void]$out.Append((Format-PromptLine $segments)).Append("`n").Append($caret).Append(' ')
-
-    if ($PromptSettings.ShellIntegration) { [void]$out.Append("`e]133;B`a") }
-
-    if ($lastHistory) { $script:PromptLastHistoryId = $lastHistory.Id }
-    $script:PromptDrawn = $true
-
-    # Leave $LASTEXITCODE as the command left it: the git call above overwrote
-    # it, and code that reads it after the prompt has drawn deserves the truth.
-    $global:LASTEXITCODE = $lastExit
-    return $out.ToString()
 }
 
 #endregion
