@@ -81,6 +81,266 @@ function HOME {
 Set-Alias ~ HOME
 
 #endregion
+#region Navigation
+
+# Up one or more directories.
+#
+# Quiet on purpose, unlike HOME above: that is a destination, and worth seeing
+# the contents of on arrival, while these are transit and often run two or three
+# times in a row. Append 'Get-ChildItem' if you would rather they listed.
+#
+# Going up past the root needs no guard - the provider clamps to it rather than
+# erroring - and this works in any provider that understands '..', so it is
+# equally at home in HKLM: as on disk.
+function up {
+    [CmdletBinding()]
+    param([ValidateRange(1, 32)][int] $Levels = 1)
+    Set-Location -Path ((1..$Levels | ForEach-Object { '..' }) -join [System.IO.Path]::DirectorySeparatorChar)
+}
+
+# '..' and '...' are paths in PowerShell but never commands, so these add
+# something rather than shadowing it. 'cd ..' is unaffected: there '..' is an
+# argument, not the command being resolved.
+function ..  { up 1 }
+function ... { up 2 }
+
+# Make a directory and move into it. -Force keeps it idempotent - an existing
+# directory comes back instead of an error, and nothing is truncated - and the
+# resolved FullName is what gets used, so a relative argument still lands right.
+function mkcd {
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0)][string] $Path)
+    $dir = New-Item -ItemType Directory -Path $Path -Force
+    Set-Location -LiteralPath $dir.FullName
+}
+
+#endregion
+#region Listing
+
+# Both forward their arguments untouched and return real FileInfo and
+# DirectoryInfo objects rather than formatted text, so 'll | Where-Object ...'
+# still works. The filesystem provider already lists directories before files,
+# so neither needs to sort.
+#
+# The only difference is -Force, which is what surfaces hidden and system
+# entries - .git and .gitignore among them.
+function ll { Get-ChildItem @args }
+function la { Get-ChildItem -Force @args }
+
+#endregion
+#region Disks
+
+# Stops at MB rather than KB: nothing here is ever that small, and a capacity in
+# KB would be noise dressed up as precision. It has to reach down that far
+# though - a Microsoft Reserved partition is 16 MB and an EFI System partition
+# around 100 MB, and rounding those to GB reports them as nothing at all.
+function Format-DiskSize {
+    param([Parameter(Mandatory)][AllowNull()] $Bytes)
+
+    if ($null -eq $Bytes) { return '' }
+    if ($Bytes -ge 1TB)   { return '{0:0.##} TB' -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB)   { return '{0:0.#} GB'  -f ($Bytes / 1GB) }
+    return '{0:0} MB' -f ($Bytes / 1MB)
+}
+
+<#
+.SYNOPSIS
+    Get-Disk with the detail it leaves out: sector geometry, partition style,
+    and every partition with its formatting, as tables.
+
+.DESCRIPTION
+    Joins Get-Disk, Get-PhysicalDisk, Get-Partition and Get-Volume into one
+    view, because the interesting facts are spread across all four: sector
+    sizes and partition style come from the disk, SSD-or-spinning from the
+    physical disk, offsets and partition type from the partition, and the
+    filesystem, label and cluster size from the volume.
+
+    Two tables by default - the disks, then their partitions. Partitions with
+    no volume, such as EFI System or Microsoft Reserved, still appear; they
+    simply have nothing to say in the formatting columns.
+
+    Reads only, and needs no elevation.
+
+.PARAMETER Number
+    Limit to these disk numbers. All disks by default.
+
+.PARAMETER Detailed
+    Render the disks as a list of every field rather than a lean table, which
+    is what you want when recording a machine's disks rather than glancing at
+    them. Adds serial number, GPT guid or MBR signature, firmware and bus
+    location - the things a table has to truncate.
+
+.PARAMETER Raw
+    Return objects instead of tables, each disk carrying its partitions in a
+    Partitions property. For piping, sorting and exporting - 'Get-DiskInfo -Raw
+    | Export-Csv' and so on.
+
+.EXAMPLE
+    disks
+    Every disk, and every partition on them.
+
+.EXAMPLE
+    disks 0 -Detailed
+    Everything known about disk 0, for the case notes.
+
+.EXAMPLE
+    (disks -Raw).Partitions | Where-Object FS -eq 'NTFS'
+    The NTFS partitions, as objects.
+#>
+function Get-DiskInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)][int[]] $Number,
+
+        [switch] $Detailed,
+
+        [switch] $Raw
+    )
+
+    if (-not (Get-Command Get-Disk -ErrorAction Ignore)) {
+        throw 'The Storage module is not available here, so disk details cannot be read.'
+    }
+
+    $disks = if ($Number) { Get-Disk -Number $Number -ErrorAction Stop }
+             else         { Get-Disk -ErrorAction Stop }
+
+    # Whether a disk is solid state lives on the physical disk rather than the
+    # logical one, so it takes a second lookup, indexed once rather than
+    # re-queried per disk.
+    $physical = @{}
+    foreach ($p in @(Get-PhysicalDisk -ErrorAction Ignore)) {
+        $id = $p.DeviceId -as [int]
+        if ($null -ne $id) { $physical[$id] = $p }
+    }
+
+    $rows = foreach ($disk in $disks) {
+
+        $phys = $physical[[int]$disk.Number]
+
+        $media  = ''
+        $spindle = $null
+        if ($phys) {
+            $media   = $phys.MediaType
+            $spindle = $phys.SpindleSpeed
+        }
+
+        $flags = [System.Collections.Generic.List[string]]::new()
+        if ($disk.IsBoot)     { $flags.Add('boot') }
+        if ($disk.IsSystem)   { $flags.Add('system') }
+        if ($disk.IsReadOnly) { $flags.Add('READONLY') }
+        if ($disk.IsOffline)  { $flags.Add('OFFLINE') }
+
+        # A GPT disk carries a guid and an MBR disk a signature; never both, so
+        # one column can hold whichever identifies this one.
+        $identifier = if ($disk.Guid) { $disk.Guid } else { $disk.Signature }
+
+        # Trailing dots and padding turn up in serials read over some buses.
+        $serial = ''
+        if ($disk.SerialNumber) { $serial = $disk.SerialNumber.Trim().TrimEnd('.') }
+
+        $partitions = foreach ($part in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Ignore)) {
+
+            $volume = $part | Get-Volume -ErrorAction Ignore
+
+            $letter = ''
+            if ($part.DriveLetter) { $letter = '{0}:' -f $part.DriveLetter }
+
+            $label = ''; $fs = ''; $cluster = $null; $free = ''; $used = ''
+            $freeBytes = $null
+            if ($volume) {
+                $label     = $volume.FileSystemLabel
+                $fs        = $volume.FileSystem
+                $cluster   = $volume.AllocationUnitSize
+                $freeBytes = $volume.SizeRemaining
+                $free      = Format-DiskSize $volume.SizeRemaining
+                if ($volume.Size -gt 0) {
+                    $used = '{0}%' -f [math]::Round((($volume.Size - $volume.SizeRemaining) / $volume.Size) * 100)
+                }
+            }
+
+            $pflags = [System.Collections.Generic.List[string]]::new()
+            if ($part.IsBoot)   { $pflags.Add('boot') }
+            if ($part.IsActive) { $pflags.Add('active') }
+            if ($part.IsHidden) { $pflags.Add('hidden') }
+
+            # The byte offset matters, but imaging and carving tools want it in
+            # sectors, so that is what the table shows; the bytes stay on the
+            # object for anyone who needs them.
+            $startSector = $null
+            if ($disk.LogicalSectorSize -gt 0) {
+                $startSector = [int64]($part.Offset / $disk.LogicalSectorSize)
+            }
+
+            [pscustomobject]@{
+                Disk        = $part.DiskNumber
+                Part        = $part.PartitionNumber
+                Letter      = $letter
+                Label       = $label
+                FS          = $fs
+                Cluster     = $cluster
+                Size        = Format-DiskSize $part.Size
+                Free        = $free
+                Used        = $used
+                StartSector = $startSector
+                Type        = $part.Type
+                Flags       = $pflags -join ' '
+                OffsetBytes = $part.Offset
+                SizeBytes   = $part.Size
+                FreeBytes   = $freeBytes
+                GptType     = $part.GptType
+                MbrType     = $part.MbrType
+                Guid        = $part.Guid
+            }
+        }
+
+        [pscustomobject]@{
+            Disk               = $disk.Number
+            Name               = $disk.FriendlyName
+            Media              = $media
+            Bus                = $disk.BusType
+            Size               = Format-DiskSize $disk.Size
+            Style              = $disk.PartitionStyle
+            # Logical over physical. A 512e drive reports 512/4096, and that
+            # mismatch is the sort of thing that decides how it gets imaged.
+            Sector             = '{0}/{1}' -f $disk.LogicalSectorSize, $disk.PhysicalSectorSize
+            Parts              = $disk.NumberOfPartitions
+            Health             = $disk.HealthStatus
+            Flags              = $flags -join ' '
+            Serial             = $serial
+            Identifier         = $identifier
+            Firmware           = $disk.FirmwareVersion
+            Location           = $disk.Location
+            SizeBytes          = $disk.Size
+            LogicalSectorSize  = $disk.LogicalSectorSize
+            PhysicalSectorSize = $disk.PhysicalSectorSize
+            SpindleSpeed       = $spindle
+            Path               = $disk.Path
+            Partitions         = @($partitions)
+        }
+    }
+
+    $rows = @($rows)
+    if ($Raw) { return $rows }
+
+    if ($Detailed) {
+        $rows | Select-Object -Property * -ExcludeProperty Partitions | Format-List
+    }
+    else {
+        # Serial and the rest are left out here on purpose: they are wide enough
+        # to push the table past the window and get truncated. -Detailed is
+        # where they belong.
+        $rows | Format-Table -AutoSize Disk, Name, Media, Bus, Size, Style, Sector, Parts, Health, Flags
+    }
+
+    $allPartitions = @($rows.Partitions)
+    if ($allPartitions.Count -gt 0) {
+        $allPartitions | Format-Table -AutoSize Disk, Part, Letter, Label, FS, Cluster, Size, Free, Used, StartSector, Type, Flags
+    }
+}
+
+Set-Alias -Name 'disks' -Value Get-DiskInfo
+
+#endregion
 #region File hashes
 
 function md5 {
