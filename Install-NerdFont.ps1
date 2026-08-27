@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Downloads and installs a Nerd Font (patched) from the ryanoasis/nerd-fonts
@@ -33,6 +34,11 @@
 .PARAMETER Version
     Pin a nerd-fonts release tag, e.g. 'v3.5.1'. Defaults to the latest release.
 
+.PARAMETER ArchivePath
+    Install from a font archive already on disk instead of fetching one. Nothing
+    is resolved and nothing is downloaded, so this works with no network at all.
+    Save-DeployCache.ps1 produces such an archive; -Version is ignored.
+
 .EXAMPLE
     .\Install-NerdFont.ps1
     Install all FiraCode Nerd Font faces for the current user.
@@ -58,6 +64,8 @@ param(
     [switch] $SetTerminalFont,
 
     [string] $Version,
+
+    [string] $ArchivePath,
 
     [switch] $Force
 )
@@ -160,39 +168,60 @@ Write-Note "Fonts    : $FontDir"
 Write-Note "Registry : $RegKey"
 
 # --- 2. Resolve the release ---------------------------------------------------
-
-Write-Step 'Resolving release'
-
-if ($Version) {
-    $tag = $Version
-    $url = "https://github.com/ryanoasis/nerd-fonts/releases/download/$tag/$Font.zip"
-}
-else {
-    $api  = 'https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest'
-    $rel  = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'PowerShell' }
-    $tag  = $rel.tag_name
-    $asset = $rel.assets | Where-Object name -EQ "$Font.zip"
-    if (-not $asset) {
-        throw "No asset '$Font.zip' in nerd-fonts $tag. Check the font name at https://github.com/ryanoasis/nerd-fonts/releases"
-    }
-    $url = $asset.browser_download_url
-}
-Write-Ok "$Font @ $tag"
-
-# --- 3. Download and extract --------------------------------------------------
+# With -ArchivePath there is nothing to resolve and nothing to fetch: the whole
+# point is that this runs on a machine with no route to GitHub.
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "nerdfont-$Font-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-$zip  = Join-Path $work "$Font.zip"
 
-if ($PSCmdlet.ShouldProcess($url, 'Download')) {
-    New-Item -ItemType Directory -Path $work -Force | Out-Null
-    Write-Step 'Downloading'
-    $ProgressPreference = 'SilentlyContinue'   # ~10x faster for large files
-    Invoke-WebRequest -Uri $url -OutFile $zip
-    Write-Ok "$([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB"
+if ($ArchivePath) {
+    Write-Step 'Using local archive'
 
-    Write-Step 'Extracting'
-    Expand-Archive -Path $zip -DestinationPath $work -Force
+    if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+        throw "Archive not found: $ArchivePath"
+    }
+
+    $zip = (Resolve-Path -LiteralPath $ArchivePath).Path
+    Write-Ok "$([math]::Round((Get-Item -LiteralPath $zip).Length / 1MB, 1)) MB from $zip"
+
+    if ($PSCmdlet.ShouldProcess($zip, 'Extract')) {
+        New-Item -ItemType Directory -Path $work -Force | Out-Null
+        Write-Step 'Extracting'
+        Expand-Archive -LiteralPath $zip -DestinationPath $work -Force
+    }
+}
+else {
+    Write-Step 'Resolving release'
+
+    if ($Version) {
+        $tag = $Version
+        $url = "https://github.com/ryanoasis/nerd-fonts/releases/download/$tag/$Font.zip"
+    }
+    else {
+        $api  = 'https://api.github.com/repos/ryanoasis/nerd-fonts/releases/latest'
+        $rel  = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'PowerShell' }
+        $tag  = $rel.tag_name
+        $asset = $rel.assets | Where-Object name -EQ "$Font.zip"
+        if (-not $asset) {
+            throw "No asset '$Font.zip' in nerd-fonts $tag. Check the font name at https://github.com/ryanoasis/nerd-fonts/releases"
+        }
+        $url = $asset.browser_download_url
+    }
+    Write-Ok "$Font @ $tag"
+
+    # --- 3. Download and extract ----------------------------------------------
+
+    $zip = Join-Path $work "$Font.zip"
+
+    if ($PSCmdlet.ShouldProcess($url, 'Download')) {
+        New-Item -ItemType Directory -Path $work -Force | Out-Null
+        Write-Step 'Downloading'
+        $ProgressPreference = 'SilentlyContinue'   # ~10x faster for large files
+        Invoke-WebRequest -Uri $url -OutFile $zip
+        Write-Ok "$([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB"
+
+        Write-Step 'Extracting'
+        Expand-Archive -Path $zip -DestinationPath $work -Force
+    }
 }
 
 $pattern = switch ($Variant) {

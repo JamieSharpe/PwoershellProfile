@@ -859,6 +859,83 @@ function prompt {
 }
 
 #endregion
+#region PSReadLine
+
+# Predictive IntelliSense: while you type, PSReadLine offers whole commands
+# drawn from two sources - your own history, and any predictor plugin that has
+# registered itself. F2 switches between the list and inline views live, F4
+# shows the full tooltip for the selected row, and Right Arrow or End accepts a
+# suggestion (Ctrl+Right Arrow takes it one word at a time).
+#
+# Predictor modules the profile will use if they are installed. Deploy-Profile
+# installs these; add to the list and it will install those too. Anything
+# missing is skipped silently, so the profile still works on a bare machine.
+$PSReadLinePredictors = @('CompletionPredictor')
+
+# Guarded on PSReadLine actually being loaded, which it is not in a
+# non-interactive host - including the 'pwsh -NoProfile' check Deploy-Profile
+# runs to verify this file, so the region has to be skippable, not assumed.
+if (Get-Module -Name PSReadLine) {
+
+    # A plugin predictor only registers with the subsystem when its module is
+    # imported; installed-but-never-imported produces no predictions at all.
+    # CompletionPredictor feeds ordinary tab-completion results in as
+    # predictions, which is what makes suggestions reach commands never typed
+    # before rather than only ones already in history.
+    foreach ($predictor in $PSReadLinePredictors) {
+        if (Get-Module -Name $predictor) { continue }
+        if (-not (Get-Module -Name $predictor -ListAvailable)) { continue }
+        try { Import-Module -Name $predictor -ErrorAction Stop }
+        catch { Write-Warning "Predictor '$predictor' not loaded: $($_.Exception.Message)" }
+    }
+
+    # 'Plugin' as a source arrived in PSReadLine 2.2; older versions know only
+    # 'History' and throw on the enum value rather than degrading.
+    $PSReadLineSource = if ((Get-Module -Name PSReadLine).Version -ge [version]'2.2.0') {
+        'HistoryAndPlugin'
+    }
+    else {
+        'History'
+    }
+
+    # PSReadLine refuses to predict where the console lacks virtual terminal
+    # processing or output is redirected, and says so loudly. Checking first
+    # keeps that off the screen of anyone piping a session to a file, where the
+    # warning would be noise about a feature they cannot use anyway.
+    if ($Host.UI.SupportsVirtualTerminal -and -not [Console]::IsOutputRedirected) {
+        try {
+            Set-PSReadLineOption -PredictionSource $PSReadLineSource -ErrorAction Stop
+
+            # ListView shows several candidates at once, each labelled with
+            # where it came from, instead of the single inline ghost suggestion.
+            Set-PSReadLineOption -PredictionViewStyle ListView -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Prediction not enabled: $($_.Exception.Message)"
+        }
+    }
+
+    # History is deliberately kept on disk. Predictions are only as good as what
+    # they have to draw on, and a session-only history starts cold every time.
+    # The consequence is worth being clear about: anything ever typed here can be
+    # suggested back later, in front of whoever happens to be watching. If that
+    # ever outweighs the convenience, -AddToHistoryHandler can return
+    # 'MemoryOnly' for lines matching a pattern, which keeps them recallable in
+    # the session but off the disk.
+    Set-PSReadLineOption -HistorySaveStyle SaveIncrementally
+    Set-PSReadLineOption -MaximumHistoryCount 10000
+
+    # Matched to the prompt palette: dim grey for the inline ghost text, the
+    # git-dirty amber for the list marker and source label, and the user
+    # segment's blue behind the selected row.
+    Set-PSReadLineOption -Colors @{
+        InlinePrediction       = "`e[38;2;95;95;95m"
+        ListPrediction         = "`e[38;2;215;160;32m"
+        ListPredictionSelected = "`e[48;2;45;95;139m"
+    }
+}
+
+#endregion
 #region Elevation
 
 # Start a new elevated process. With arguments, runs a single command elevated;

@@ -1,0 +1,7 @@
+# Populated by Save-DeployCache.ps1 for offline deploys: a nerd-font archive is
+# tens of MB and git is not a binary distribution channel. The cache is meant to
+# travel by copying the folder, not by being pushed.
+cache/
+
+# Windows Terminal settings backups written by Enable-ShellIntegration.ps1
+*.backup-*

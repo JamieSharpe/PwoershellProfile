@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Sets up this PowerShell 7 environment: Nerd Font, terminal fonts, profile.
@@ -8,12 +9,23 @@
 
       1. Install FiraCode Nerd Font (patched), per-user, no elevation
       2. Point Windows Terminal, the legacy console and VS Code at it
-      3. Symlink the profile so 'git pull' updates the live copy
-      4. Move aside any leftover Windows PowerShell 5.1 profile
-      5. Verify the profile loads
+      3. Install the predictor modules the profile uses for autocomplete
+      4. Symlink the profile so 'git pull' updates the live copy
+      5. Move aside any leftover Windows PowerShell 5.1 profile
+      6. Verify the profile loads
 
     Every step is idempotent, backs up whatever it replaces, and honours -WhatIf.
     Use the -Skip* switches to leave parts alone.
+
+    Only steps 1 and 3 need a network. To deploy somewhere with none, run
+    '.\Deploy-Profile.ps1 -Prepare' on a connected machine to fill the cache,
+    copy the whole folder across, then run '.\Deploy-Profile.ps1 -Offline'.
+    A cache is used automatically whenever one is present, online or not.
+
+    The cache also holds a PowerShell 7 installer, since this script requires
+    version 7 and so cannot be what installs it. Install that first on a bare
+    machine; cache\INSTALL.txt spells out the steps in plain text, for the case
+    where there is no PowerShell 7 around to read this help with.
 
     PowerShell 7 only - run it with pwsh.
 
@@ -30,6 +42,39 @@
 
 .PARAMETER SkipTerminalFont
     Install the font but leave Windows Terminal, conhost and VS Code alone.
+
+.PARAMETER SkipPredictor
+    Do not install the predictor modules. The profile still enables Predictive
+    IntelliSense from command history; only the plugin half, which can predict
+    commands never typed before, is missing.
+
+.PARAMETER PredictorModule
+    Predictor modules to install from the PSGallery, per-user. Defaults to
+    CompletionPredictor, which feeds tab-completion results in as predictions.
+    Add Az.Tools.Predictor here if you work in Az. Keep this in step with
+    $PSReadLinePredictors in the profile, which decides what actually gets
+    imported.
+
+.PARAMETER Prepare
+    Download PowerShell, the font and the predictor modules into the cache and
+    stop, installing nothing. Run this on a connected machine, then copy the
+    folder to the offline one. Hands off to Save-DeployCache.ps1, which has more
+    options - pinned versions, architecture, and a portable zip instead of the
+    MSI.
+
+.PARAMETER SkipPowerShell
+    Only meaningful with -Prepare: leave the PowerShell installer out of the
+    cache, saving over 100 MB, for when the offline machine already has it.
+    This script cannot install PowerShell in any case - it needs version 7 to
+    run at all.
+
+.PARAMETER Offline
+    Install using only what is in the cache, and fail loudly rather than quietly
+    reaching for the network. Refuses to run without a cache, and rejects -Pull.
+
+.PARAMETER CachePath
+    Where the cache lives. Defaults to 'cache' inside the repo, which is what
+    makes it travel when the folder is copied.
 
 .PARAMETER KeepLegacyProfile
     Leave the Windows PowerShell 5.1 profile in place. By default it is moved
@@ -56,6 +101,10 @@
     Profile only, leave fonts alone.
 
 .EXAMPLE
+    .\Deploy-Profile.ps1 -PredictorModule CompletionPredictor, Az.Tools.Predictor
+    Add the Azure predictor alongside the default one.
+
+.EXAMPLE
     .\Deploy-Profile.ps1 -WhatIf
     Show what would happen without changing anything.
 #>
@@ -69,6 +118,18 @@ param(
     [switch] $SkipFont,
 
     [switch] $SkipTerminalFont,
+
+    [switch] $SkipPredictor,
+
+    [string[]] $PredictorModule = @('CompletionPredictor'),
+
+    [switch] $Prepare,
+
+    [switch] $SkipPowerShell,
+
+    [switch] $Offline,
+
+    [string] $CachePath,
 
     [switch] $KeepLegacyProfile,
 
@@ -88,6 +149,55 @@ $SourceFile = Join-Path $RepoRoot 'Microsoft.PowerShell_profile.ps1'
 
 if (-not (Test-Path -LiteralPath $SourceFile)) {
     throw "Profile not found in repo: $SourceFile"
+}
+
+# --- 0. Cache -----------------------------------------------------------------
+# Two of the steps below reach out to the network: the font comes from GitHub
+# releases and the predictor modules from the PSGallery. Save-DeployCache.ps1
+# pulls both down in advance, and this reads whatever it left behind.
+
+if (-not $CachePath) { $CachePath = Join-Path $RepoRoot 'cache' }
+
+if ($Prepare) {
+    if ($Offline) { throw '-Prepare needs a network; it cannot be combined with -Offline.' }
+
+    $prepareScript = Join-Path $RepoRoot 'Save-DeployCache.ps1'
+    if (-not (Test-Path -LiteralPath $prepareScript)) {
+        throw "Save-DeployCache.ps1 not found next to this script: $prepareScript"
+    }
+
+    $prepareArgs = @{ CachePath = $CachePath; Font = $Font; PredictorModule = $PredictorModule }
+    if ($SkipFont)         { $prepareArgs.SkipFont       = $true }
+    if ($SkipPredictor)    { $prepareArgs.SkipPredictor  = $true }
+    if ($SkipPowerShell)   { $prepareArgs.SkipPowerShell = $true }
+    if ($WhatIfPreference) { $prepareArgs.WhatIf         = $true }
+
+    & $prepareScript @prepareArgs
+    return
+}
+
+$Cache = $null
+$ManifestPath = Join-Path $CachePath 'cache.json'
+
+if (Test-Path -LiteralPath $ManifestPath) {
+    try {
+        $Cache = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        Write-Step 'Cache'
+        Write-Ok "$CachePath (captured $($Cache.createdUtc) on $($Cache.createdOn))"
+    }
+    catch {
+        Write-Warning "Cache manifest unreadable, ignoring it: $($_.Exception.Message)"
+        $Cache = $null
+    }
+}
+
+if ($Offline) {
+    if (-not $Cache) {
+        throw "-Offline needs a cache, and none was found at $CachePath. Run '.\Save-DeployCache.ps1' on a connected machine first, then copy this folder across."
+    }
+    if ($Pull) {
+        throw '-Pull needs a network; it cannot be combined with -Offline.'
+    }
 }
 
 # --- 1. Optional git pull -----------------------------------------------------
@@ -120,8 +230,97 @@ if (-not $SkipFont) {
     if (-not $SkipTerminalFont) { $fontArgs.SetTerminalFont = $true }
     if ($WhatIfPreference)      { $fontArgs.WhatIf          = $true }
 
+    # A cached archive is preferred whenever one is there, online or not: it is
+    # the same bytes and it saves a download.
+    $cachedFont = @($Cache.fonts | Where-Object { $_.font -eq $Font })[0]
+
+    if ($cachedFont) {
+        $archive = Join-Path $CachePath ($cachedFont.file -replace '/', '\')
+
+        if (-not (Test-Path -LiteralPath $archive)) {
+            if ($Offline) { throw "Cache lists $($cachedFont.file) but the file is missing from $CachePath." }
+            Write-Warning "Cached font missing from disk, falling back to a download: $archive"
+        }
+        else {
+            # The cache is expected to have crossed a USB stick or a share, so
+            # verify it rather than trusting it, before unpacking fonts from it.
+            Write-Step 'Verifying cached font'
+            $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+            if ($actual -ne $cachedFont.sha256) {
+                throw "Cached font is corrupt: $archive`nexpected $($cachedFont.sha256)`ngot      $actual"
+            }
+            Write-Ok "$($cachedFont.font) $($cachedFont.tag), SHA256 matches"
+            $fontArgs.ArchivePath = $archive
+        }
+    }
+    elseif ($Offline) {
+        throw "-Offline was given but the cache holds no font for '$Font'. Re-run Save-DeployCache.ps1 with -Font $Font."
+    }
+
     & $fontScript @fontArgs
     if ($LASTEXITCODE) { throw "Font install failed (exit $LASTEXITCODE)" }
+    Write-Host ''
+}
+
+# --- 1c. Predictor modules ----------------------------------------------------
+# The profile turns on Predictive IntelliSense either way, drawing on command
+# history. These modules add the plugin half of it, which can suggest commands
+# never typed before. The profile imports whichever it finds and carries on
+# quietly without the rest, so this step is a convenience and never fatal.
+
+if (-not $SkipPredictor -and $PredictorModule.Count) {
+    Write-Step 'Predictor modules'
+
+    $UserModuleDir = Join-Path (Split-Path -Parent $PROFILE.CurrentUserAllHosts) 'Modules'
+
+    foreach ($name in $PredictorModule) {
+        if (Get-Module -Name $name -ListAvailable) {
+            Write-Note "$name already installed"
+            continue
+        }
+
+        $cachedModule = @($Cache.modules | Where-Object { $_.name -eq $name })[0]
+
+        # From the cache this is a directory copy into the module path - no
+        # repository registration, nothing to resolve, and so nothing that can
+        # fail on a machine with no route to the gallery.
+        if ($cachedModule) {
+            $source = Join-Path $CachePath ($cachedModule.path -replace '/', '\')
+
+            if (-not (Test-Path -LiteralPath $source)) {
+                if ($Offline) { throw "Cache lists $($cachedModule.path) but the folder is missing from $CachePath." }
+                Write-Warning "Cached module missing from disk, falling back to the gallery: $source"
+            }
+            elseif ($PSCmdlet.ShouldProcess($name, "Copy $($cachedModule.version) from cache")) {
+                $dest = Join-Path $UserModuleDir "$name\$($cachedModule.version)"
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                Copy-Item -Path (Join-Path $source '*') -Destination $dest -Recurse -Force
+                Write-Ok "Installed $name $($cachedModule.version) from cache"
+                continue
+            }
+            else { continue }
+        }
+
+        if ($Offline) {
+            Write-Warning "-Offline was given but the cache holds no module '$name'; skipping."
+            Write-Note "Re-run Save-DeployCache.ps1 with -PredictorModule $name to include it."
+            continue
+        }
+
+        if (-not $PSCmdlet.ShouldProcess($name, 'Install-Module from PSGallery (CurrentUser)')) { continue }
+
+        try {
+            # -Force answers the untrusted-repository prompt, which a deploy
+            # script must not block on.
+            Install-Module -Name $name -Repository PSGallery -Scope CurrentUser -Force -ErrorAction Stop
+            Write-Ok "Installed $name"
+        }
+        catch {
+            # Autocomplete is a nicety; losing it must not cost you the profile.
+            Write-Warning "Could not install ${name}: $($_.Exception.Message)"
+            Write-Note 'Prediction from history still works. Install it later, or pass -SkipPredictor.'
+        }
+    }
     Write-Host ''
 }
 

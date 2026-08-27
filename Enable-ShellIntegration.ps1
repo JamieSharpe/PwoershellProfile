@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Turns on the Windows Terminal half of shell integration, so it acts on the
