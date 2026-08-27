@@ -190,7 +190,11 @@ function Format-DiskSize {
 function Get-DiskInfo {
     [CmdletBinding()]
     param(
-        [Parameter(Position = 0)][int[]] $Number,
+        # uint32 rather than int to match what Get-Disk declares. A scalar int
+        # coerces on its own, but an array of them does not: the CIM binder
+        # rejects int[] against a uint[] parameter outright, so 'disks 0' would
+        # work while 'disks 0,1' failed.
+        [Parameter(Position = 0)][uint32[]] $Number,
 
         [switch] $Detailed,
 
@@ -203,6 +207,13 @@ function Get-DiskInfo {
 
     $disks = if ($Number) { Get-Disk -Number $Number -ErrorAction Stop }
              else         { Get-Disk -ErrorAction Stop }
+
+    # Sorted rather than left to chance: neither Get-Disk nor Get-Partition
+    # promises an order, and -Number hands them back in whatever order it was
+    # given. Doing it here rather than at display time means -Raw comes out
+    # ordered too, and the flat partition table inherits disk-then-partition
+    # order for free.
+    $disks = @($disks | Sort-Object Number)
 
     # Whether a disk is solid state lives on the physical disk rather than the
     # logical one, so it takes a second lookup, indexed once rather than
@@ -238,7 +249,13 @@ function Get-DiskInfo {
         $serial = ''
         if ($disk.SerialNumber) { $serial = $disk.SerialNumber.Trim().TrimEnd('.') }
 
-        $partitions = foreach ($part in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Ignore)) {
+        # By partition number, which is what the table is keyed on. Note that
+        # this is not necessarily physical order - numbers survive deletions and
+        # can end up out of step with the offsets - so StartSector is where to
+        # look for the layout on the platter.
+        $diskPartitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Ignore | Sort-Object PartitionNumber)
+
+        $partitions = foreach ($part in $diskPartitions) {
 
             $volume = $part | Get-Volume -ErrorAction Ignore
 
@@ -467,6 +484,22 @@ $PromptSettings = [ordered]@{
     # Warn in the prompt itself when this session is not being transcribed.
     ShowTranscriptWarning = $true
 
+    # A line above the prompt reporting how the last command went: whether it
+    # succeeded, its exit code if not, and how long it took. It annotates the
+    # command that just finished, so it sits directly under that command's
+    # output rather than inside the prompt block below.
+    #
+    # Unlike the duration segment it has no threshold - the point is to see the
+    # timing of everything, not only the slow ones.
+    ShowStatusLine = $true
+
+    # The two segments the status line makes redundant. Both off by default
+    # because showing the same duration and the same exit code twice on one
+    # screen is clutter, not emphasis; turn either back on if you would rather
+    # have it in the prompt block, or turn ShowStatusLine off and rely on them.
+    ShowDurationSegment = $false
+    ShowFailedSegment   = $false
+
     TimeFormat = 'yyyy-MM-dd HH:mm:ss'
 
     # Wrap the segments onto further lines when they outgrow the window, rather
@@ -555,6 +588,12 @@ $PromptSettings = [ordered]@{
         Failed       = @{ Fg = '#FFFFFF'; Bg = '#A31515' }
         Duration     = @{ Fg = '#C6C6DA'; Bg = '#4B4B6A' }
         Time         = @{ Fg = '#9E9E9E'; Bg = '#2E2E2E' }
+        # The status line is plain coloured text, not a filled block: it is a
+        # footnote to the output above it, and a powerline bar would give it
+        # more weight than the prompt it sits over.
+        StatusOk     = @{ Fg = '#57A64A' }
+        StatusFail   = @{ Fg = '#D14545' }
+        StatusTime   = @{ Fg = '#8A8A8A' }
         CaretOk      = @{ Fg = '#57A64A' }
         CaretFail    = @{ Fg = '#D14545' }
     }
@@ -643,6 +682,8 @@ function Update-PromptTheme {
             Clock      = "`u{f017} "  # clock, for how long the last command took
             Calendar   = "`u{f073} "  # calendar, for the wall clock
             Failed     = "`u{f00d} "  # cross
+            StatusOk   = "`u{f00c}"   # tick, for the status line above the prompt
+            StatusFail = "`u{f00d}"   # cross
             Ahead      = "`u{21e1}"
             Behind     = "`u{21e3}"
             Caret      = "`u{276f}"
@@ -670,6 +711,8 @@ function Update-PromptTheme {
             Clock      = 'took '
             Calendar   = ''
             Failed     = 'exit '
+            StatusOk   = 'OK'
+            StatusFail = 'FAIL'
             Ahead      = '+'
             Behind     = '-'
             Caret      = '>'
@@ -1099,10 +1142,24 @@ function Get-PromptEnvContext {
     return $parts -join ' '
 }
 
-# The exit status to hand the terminal in an OSC 133;D mark. A PowerShell-level
-# error carries no numeric code, so -1 says "this failed" without inventing one;
-# 0 means success, and anything else is a real native exit code.
-function Get-PromptExitStatus {
+# How the last command ended, decided once and used three ways: the status line
+# above the prompt, the optional failed segment, and the exit status handed to
+# the terminal in an OSC 133;D mark.
+#
+# $? decides whether anything failed at all. $LASTEXITCODE lingers from the last
+# native command, so on its own it would keep flagging a failure long after a
+# successful cmdlet.
+#
+# Code is deliberately null for a PowerShell-level failure. A cmdlet error
+# carries no exit code, and $LASTEXITCODE at that moment still holds whatever
+# the last native command left there - reporting that is worse than reporting
+# nothing, because a stale number looks like a real answer. The error's
+# HistoryId matching the current history entry is what identifies the failure as
+# PowerShell's own, and is the same check Microsoft's shell-integration sample
+# uses. MarkStatus still has to be a number for the terminal, so -1 says "this
+# failed" there without inventing a code.
+function Get-PromptCommandResult {
+    [CmdletBinding()]
     param(
         [bool] $Succeeded,
         [AllowNull()] $LastExit,
@@ -1110,10 +1167,20 @@ function Get-PromptExitStatus {
         [AllowNull()] $LastHistory
     )
 
-    if ($Succeeded) { return 0 }
-    if ($LastError -and $LastHistory -and $LastError.InvocationInfo.HistoryId -eq $LastHistory.Id) { return -1 }
-    if ($LastExit) { return $LastExit }
-    return 1
+    if ($Succeeded) {
+        return [pscustomobject]@{ Failed = $false; Code = $null; MarkStatus = 0 }
+    }
+
+    $isPowerShellError = [bool]($LastError -and $LastHistory -and
+                                $LastError.InvocationInfo.HistoryId -eq $LastHistory.Id)
+
+    if ($isPowerShellError) {
+        return [pscustomobject]@{ Failed = $true; Code = $null; MarkStatus = -1 }
+    }
+
+    $code = if ($LastExit) { $LastExit } else { $null }
+    $mark = if ($null -ne $code) { $code } else { 1 }
+    return [pscustomobject]@{ Failed = $true; Code = $code; MarkStatus = $mark }
 }
 
 # How wide the prompt may be before it wraps. Zero means "do not wrap", which is
@@ -1212,6 +1279,17 @@ function prompt {
         $lastHistory     = Get-History -Count 1
         $isFirstPrompt   = -not $script:PromptDrawn
         $historyAdvanced = $lastHistory -and $lastHistory.Id -ne $script:PromptLastHistoryId
+
+        # Resolved once: the status line and the duration segment both want it,
+        # and it is the same command either way.
+        $elapsedSeconds = $null
+        if ($historyAdvanced) {
+            $elapsedSeconds = ($lastHistory.EndExecutionTime - $lastHistory.StartExecutionTime).TotalSeconds
+        }
+
+        $result      = Get-PromptCommandResult -Succeeded $succeeded -LastExit $lastExit -LastError $lastError -LastHistory $lastHistory
+        $failed      = $result.Failed
+        $failureCode = $result.Code
 
         $location     = $ExecutionContext.SessionState.Path.CurrentLocation
         $isFileSystem = $location.Provider.Name -eq 'FileSystem'
@@ -1340,21 +1418,17 @@ function prompt {
             $segments.Add(@{ Style = 'NoLog'; Text = (' {0} ' -f $glyphs.NoLog.Trim()) })
         }
 
-        # Gate on $? alone: $LASTEXITCODE lingers from the last native command,
-        # so on its own it would keep flagging a failure long after a successful
-        # cmdlet.
-        if (-not $succeeded) {
-            $code = if ($lastExit) { $lastExit } else { 1 }
-            $segments.Add(@{ Style = 'Failed'; Text = (' {0}{1} ' -f $glyphs.Failed, $code) })
+        # Both of these are off by default, superseded by the status line above
+        # the prompt; they remain for anyone who would rather have the facts in
+        # the prompt block itself.
+        if ($PromptSettings.ShowFailedSegment -and $failed) {
+            $shown = if ($null -ne $failureCode) { $failureCode } else { '' }
+            $segments.Add(@{ Style = 'Failed'; Text = (' {0}{1} ' -f $glyphs.Failed, $shown).Replace('  ', ' ') })
         }
 
-        # Only for a command that actually just ran; without the history check
-        # the previous command's duration would sit there looking current.
-        if ($historyAdvanced) {
-            $elapsed = ($lastHistory.EndExecutionTime - $lastHistory.StartExecutionTime).TotalSeconds
-            if ($elapsed * 1000 -ge $PromptSettings.DurationThresholdMs) {
-                $segments.Add(@{ Style = 'Duration'; Text = (' {0}{1} ' -f $glyphs.Clock, (Format-PromptDuration $elapsed)) })
-            }
+        if ($PromptSettings.ShowDurationSegment -and $null -ne $elapsedSeconds -and
+            ($elapsedSeconds * 1000) -ge $PromptSettings.DurationThresholdMs) {
+            $segments.Add(@{ Style = 'Duration'; Text = (' {0}{1} ' -f $glyphs.Clock, (Format-PromptDuration $elapsedSeconds)) })
         }
 
         if ($PromptSettings.ShowTime) {
@@ -1370,6 +1444,34 @@ function prompt {
             $caret = '{0}{1}{2}' -f $caretStyle.Fg, $caret, "`e[0m"
         }
 
+        # How the last command went, reported above the prompt. Only when one
+        # actually ran: Enter on an empty line, or Ctrl+C, would otherwise
+        # repeat the previous verdict as though it were fresh.
+        $statusLine = ''
+        if ($PromptSettings.ShowStatusLine -and $null -ne $elapsedSeconds) {
+            $duration = Format-PromptDuration $elapsedSeconds
+
+            if ($failed) {
+                # The code is appended only when there is an honest one to
+                # give; a bare mark beats a borrowed number.
+                $mark = if ($null -ne $failureCode) { '{0} {1}' -f $glyphs.StatusFail, $failureCode }
+                        else                        { $glyphs.StatusFail }
+                $markStyle = 'StatusFail'
+            }
+            else {
+                $mark      = $glyphs.StatusOk
+                $markStyle = 'StatusOk'
+            }
+
+            $statusLine = if ($PromptSettings.UseColour) {
+                '{0}{1}{2} {3}{4}{2}' -f $script:PromptStyles[$markStyle].Fg, $mark, "`e[0m",
+                                         $script:PromptStyles['StatusTime'].Fg, $duration
+            }
+            else {
+                '{0} {1}' -f $mark, $duration
+            }
+        }
+
         $out = [System.Text.StringBuilder]::new()
 
         # Shell integration marks. These print nothing; they tell Windows
@@ -1380,8 +1482,7 @@ function prompt {
         # showMarksOnScrollbar turned on to act on them.
         if ($PromptSettings.ShellIntegration -and -not $isFirstPrompt) {
             if ($historyAdvanced) {
-                $status = Get-PromptExitStatus -Succeeded $succeeded -LastExit $lastExit -LastError $lastError -LastHistory $lastHistory
-                [void]$out.Append("`e]133;D;$status`a")
+                [void]$out.Append("`e]133;D;$($result.MarkStatus)`a")
             }
             else {
                 # Ctrl+C, or Enter on an empty line: nothing ran, so there is no
@@ -1390,6 +1491,10 @@ function prompt {
                 [void]$out.Append("`e]133;D`a")
             }
         }
+
+        # Above the blank line, so it reads as a footnote to the output it
+        # follows rather than as part of the prompt block below it.
+        if ($statusLine) { [void]$out.Append($statusLine).Append("`n") }
 
         [void]$out.Append("`n")
 
